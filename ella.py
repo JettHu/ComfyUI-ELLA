@@ -3,11 +3,14 @@ import os
 from typing import Dict
 
 import folder_paths
+import numpy as np
 import torch
 from comfy import model_management, samplers
 from comfy.conds import CONDCrossAttn
+from PIL import Image
 
-from .model import ELLA, T5TextEmbedder
+from .adaface import AdaFaceEmbedder
+from .model import ELLA, GatedPerceiver, T5TextEmbedder
 
 ELLA_TYPE = "ELLA"
 ELLA_EMBEDS_TYPE = "ELLA_EMBEDS"
@@ -28,6 +31,12 @@ if "ella_encoder" not in folder_paths.folder_names_and_paths:
 else:
     current_paths, _ = folder_paths.folder_names_and_paths["ella_encoder"]
 folder_paths.folder_names_and_paths["ella_encoder"] = (current_paths, folder_paths.supported_pt_extensions)
+
+if "adaface" not in folder_paths.folder_names_and_paths:
+    current_paths = [os.path.join(folder_paths.models_dir, "adaface")]
+else:
+    current_paths, _ = folder_paths.folder_names_and_paths["adaface"]
+folder_paths.folder_names_and_paths["adaface"] = (current_paths, {".safetensors"})
 
 
 def ella_encode(ella: ELLA, timesteps: torch.Tensor, embeds: dict):
@@ -266,7 +275,7 @@ class EllaTextEncode:
             },
             "optional": {
                 "clip": ("CLIP", {"default": None}),
-                "text_clip": ("STRING", {"default":"", "multiline": True, "dynamicPrompts": True}),
+                "text_clip": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": True}),
             },
         }
 
@@ -307,11 +316,12 @@ class EllaTextEncode:
 
         for i in range(len(conditioning_to)):
             t1 = conditioning_to[i][0]
-            tw = torch.cat((t1, cond_from),1)
+            tw = torch.cat((t1, cond_from), 1)
             n = [tw, conditioning_to[i][1].copy()]
             out.append(n)
 
         return out
+
 
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -491,6 +501,126 @@ class SetEllaTimesteps:
         return ({**ella, "timesteps": timesteps},)
 
 
+class EMMAClipVisionApply:
+    def __init__(self):
+        self.loaded_emma = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        clipvision_emmas = [f for f in  folder_paths.get_filename_list("ella") if "clip" in f]
+        return {
+            "required": {
+                "emma_name": (clipvision_emmas,),
+                "clip_vision": ("CLIP_VISION",),
+                "image": ("IMAGE",),
+                "positive": (ELLA_EMBEDS_TYPE,),
+                "negative": (ELLA_EMBEDS_TYPE,),
+                "strength": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 10.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = (
+        ELLA_EMBEDS_TYPE,
+        ELLA_EMBEDS_TYPE,
+    )
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "apply"
+    CATEGORY = "ella/encode"
+
+    def apply(self, emma_name, clip_vision, image, positive, negative, strength):
+        if strength == 0:
+            return (positive, negative)
+
+        emma_path = folder_paths.get_full_path("ella", emma_name)
+        emma = None
+        if self.loaded_emma is not None:
+            if self.loaded_emma[0] == emma_path:
+                emma = self.loaded_emma[1]
+            else:
+                temp = self.loaded_emma
+                self.loaded_emma = None
+                del temp
+        if emma is None:
+            emma = GatedPerceiver.from_pretrained(emma_path)
+            self.loaded_emma = (emma_path, emma)
+
+        clip_vision_embeds = clip_vision.encode_image(image)
+        positive_emmas = positive.get(f"{ELLA_EMBEDS_PREFIX}emmas", [])[:]
+        positive_emmas.append((emma, clip_vision_embeds.last_hidden_state, strength))
+        negative_emmas = negative.get(f"{ELLA_EMBEDS_PREFIX}emmas", [])[:]
+        negative_emmas.append((emma, torch.zeros_like(clip_vision_embeds.last_hidden_state), strength))
+        return (
+            {**positive, f"{ELLA_EMBEDS_PREFIX}emmas": positive_emmas},
+            {**negative, f"{ELLA_EMBEDS_PREFIX}emmas": negative_emmas},
+        )
+
+
+class EMMAFaceApply:
+    _cache = None
+    def __init__(self):
+        self.loaded_emma = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        face_emmas = [f for f in  folder_paths.get_filename_list("ella") if "face" in f]
+        return {
+            "required": {
+                "emma_name": (face_emmas,),
+                "face_model_name": (folder_paths.get_filename_list("adaface"),),
+                "image": ("IMAGE",),
+                "positive": (ELLA_EMBEDS_TYPE,),
+                "negative": (ELLA_EMBEDS_TYPE,),
+                "strength": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 10.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = (
+        ELLA_EMBEDS_TYPE,
+        ELLA_EMBEDS_TYPE,
+    )
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "apply"
+    CATEGORY = "ella/encode"
+
+    def apply(self, emma_name, face_model_name, image, positive, negative, strength):
+        if strength == 0:
+            return (positive, negative)
+        if self._cache is not None:
+            face_embedder = self._cache
+        else:
+            face_embedder = AdaFaceEmbedder(folder_paths.get_full_path("adaface", face_model_name)) # type: ignore
+            self._cache = face_embedder
+
+        face_embedder.model.to("cuda")
+        emma_path = folder_paths.get_full_path("ella", emma_name)
+        emma = None
+        if self.loaded_emma is not None:
+            if self.loaded_emma[0] == emma_path:
+                emma = self.loaded_emma[1]
+            else:
+                temp = self.loaded_emma
+                self.loaded_emma = None
+                del temp
+        if emma is None:
+            emma = GatedPerceiver.from_pretrained(emma_path)
+            self.loaded_emma = (emma_path, emma)
+
+        i = 255. * image[0].cpu().numpy()
+        img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8)).resize((112, 112))
+        # rgb to bgr, [0, 255] -> [-1, 1]
+        bgr_image = ((np.array(img)[:, :, ::-1] / 255.0) - 0.5) / 0.5
+        tensor = torch.from_numpy(bgr_image.transpose(2, 0, 1)).float().unsqueeze(dim=0)
+        face_embeds = face_embedder.forward(tensor)
+        face_embedder.model.to("cpu")
+        positive_emmas = positive.get(f"{ELLA_EMBEDS_PREFIX}emmas", [])[:]
+        positive_emmas.append((emma, face_embeds, strength))
+        negative_emmas = negative.get(f"{ELLA_EMBEDS_PREFIX}emmas", [])[:]
+        negative_emmas.append((emma, torch.zeros_like(face_embeds), strength))
+        return (
+            {**positive, f"{ELLA_EMBEDS_PREFIX}emmas": positive_emmas},
+            {**negative, f"{ELLA_EMBEDS_PREFIX}emmas": negative_emmas},
+        )
+
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  Register
@@ -502,6 +632,8 @@ NODE_CLASS_MAPPINGS = {
     "EllaEncode": EllaEncode,
     "T5TextEncode #ELLA": T5TextEncode,
     "EllaTextEncode": EllaTextEncode,
+    "EMMAClipVisionApply": EMMAClipVisionApply,
+    "EMMAFaceApply": EMMAFaceApply,
     # Loaders
     "ELLALoader": ELLALoader,
     "T5TextEncoderLoader #ELLA": T5TextEncoderLoader,
