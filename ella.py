@@ -11,6 +11,7 @@ from PIL import Image
 
 from .adaface import AdaFaceEmbedder
 from .model import ELLA, GatedPerceiver, T5TextEmbedder
+from .utils import clip_vision_encode
 
 ELLA_TYPE = "ELLA"
 ELLA_EMBEDS_TYPE = "ELLA_EMBEDS"
@@ -507,7 +508,7 @@ class EMMAClipVisionApply:
 
     @classmethod
     def INPUT_TYPES(cls):
-        clipvision_emmas = [f for f in  folder_paths.get_filename_list("ella") if "clip" in f]
+        clipvision_emmas = [f for f in folder_paths.get_filename_list("ella") if "clip" in f or "person" in f]
         return {
             "required": {
                 "emma_name": (clipvision_emmas,),
@@ -516,6 +517,9 @@ class EMMAClipVisionApply:
                 "positive": (ELLA_EMBEDS_TYPE,),
                 "negative": (ELLA_EMBEDS_TYPE,),
                 "strength": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 10.0, "step": 0.01}),
+            },
+            "optional": {
+                "crop": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -527,7 +531,7 @@ class EMMAClipVisionApply:
     FUNCTION = "apply"
     CATEGORY = "ella/encode"
 
-    def apply(self, emma_name, clip_vision, image, positive, negative, strength):
+    def apply(self, emma_name, clip_vision, image, positive, negative, strength, crop=False):
         if strength == 0:
             return (positive, negative)
 
@@ -544,11 +548,12 @@ class EMMAClipVisionApply:
             emma = GatedPerceiver.from_pretrained(emma_path)
             self.loaded_emma = (emma_path, emma)
 
-        clip_vision_embeds = clip_vision.encode_image(image)
+        clip_vision_embeds = clip_vision_encode(clip_vision, image, crop=crop)
+
         positive_emmas = positive.get(f"{ELLA_EMBEDS_PREFIX}emmas", [])[:]
-        positive_emmas.append((emma, clip_vision_embeds.last_hidden_state, strength))
+        positive_emmas.append((emma, clip_vision_embeds.last_hidden_state, strength))  # type: ignore
         negative_emmas = negative.get(f"{ELLA_EMBEDS_PREFIX}emmas", [])[:]
-        negative_emmas.append((emma, torch.zeros_like(clip_vision_embeds.last_hidden_state), strength))
+        negative_emmas.append((emma, torch.zeros_like(clip_vision_embeds.last_hidden_state), strength))  # type: ignore
         return (
             {**positive, f"{ELLA_EMBEDS_PREFIX}emmas": positive_emmas},
             {**negative, f"{ELLA_EMBEDS_PREFIX}emmas": negative_emmas},
@@ -557,12 +562,13 @@ class EMMAClipVisionApply:
 
 class EMMAFaceApply:
     _cache = None
+
     def __init__(self):
         self.loaded_emma = None
 
     @classmethod
     def INPUT_TYPES(cls):
-        face_emmas = [f for f in  folder_paths.get_filename_list("ella") if "face" in f]
+        face_emmas = [f for f in folder_paths.get_filename_list("ella") if "face" in f]
         return {
             "required": {
                 "emma_name": (face_emmas,),
@@ -588,10 +594,10 @@ class EMMAFaceApply:
         if self._cache is not None:
             face_embedder = self._cache
         else:
-            face_embedder = AdaFaceEmbedder(folder_paths.get_full_path("adaface", face_model_name)) # type: ignore
+            face_embedder = AdaFaceEmbedder(folder_paths.get_full_path("adaface", face_model_name))  # type: ignore
             self._cache = face_embedder
 
-        face_embedder.model.to("cuda")
+        face_embedder.model.to("cuda")  # type: ignore
         emma_path = folder_paths.get_full_path("ella", emma_name)
         emma = None
         if self.loaded_emma is not None:
@@ -605,7 +611,7 @@ class EMMAFaceApply:
             emma = GatedPerceiver.from_pretrained(emma_path)
             self.loaded_emma = (emma_path, emma)
 
-        i = 255. * image[0].cpu().numpy()
+        i = 255.0 * image[0].cpu().numpy()
         img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8)).resize((112, 112))
         # rgb to bgr, [0, 255] -> [-1, 1]
         bgr_image = ((np.array(img)[:, :, ::-1] / 255.0) - 0.5) / 0.5
@@ -620,6 +626,7 @@ class EMMAFaceApply:
             {**positive, f"{ELLA_EMBEDS_PREFIX}emmas": positive_emmas},
             {**negative, f"{ELLA_EMBEDS_PREFIX}emmas": negative_emmas},
         )
+
 
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
